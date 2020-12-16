@@ -1,179 +1,187 @@
 const std = @import("std");
-const Thread = std.Thread;
 const ThreadPool = @This();
-const ResetEvent = std.ResetEvent;
-const Allocator = std.mem.Allocator;
 
-workers: []Worker,
-/// Protects the other fields.
-lock: std.Mutex = .{},
-active_tasks: usize = 0,
+allocator: *std.mem.Allocator,
+mutex: std.Mutex = std.Mutex{},
+threads: []*std.Thread,
+is_shutdown: bool = false,
+run_queue: RunQueue = RunQueue{},
+idle_queue: IdleQueue = IdleQueue{},
 
-const Worker = struct {
-    pool: *ThreadPool,
-    thread: *Thread,
-    reset_event: ResetEvent,
-    func: fn (context: usize) void,
-    is_idle: bool,
-    shutdown: bool = false,
-    context: usize,
+threadlocal var tls_current_pool: ?*ThreadPool = null;
+
+pub fn get() ?*ThreadPool {
+    return tls_current_pool;
+}
+
+const IdleQueue = std.SinglyLinkedList(std.AutoResetEvent);
+const RunQueue = struct {
+    head: ?*Runnable = null,
+    tail: ?*Runnable = null,
+
+    fn push(self: *RunQueue, runnable: *Runnable) void {
+        if (self.tail) |tail|
+            tail.next = runnable;
+        if (self.head == null)
+            self.head = runnable;
+        self.tail = runnable;
+        runnable.next = null;
+    }
+
+    fn pop(self: *RunQueue) ?*Runnable {
+        const runnable = self.head orelse return null;
+        self.head = runnable.next;
+        if (self.head == null) self.tail = null;
+        return runnable;
+    }
 };
 
-pub fn create(gpa: *Allocator) !*ThreadPool {
-    const pool = try gpa.create(ThreadPool);
-    errdefer gpa.destroy(pool);
+pub const Callback = fn (*Runnable) void;
+pub const Runnable = struct {
+    next: ?*Runnable = undefined,
+    callback: Callback,
 
-    const core_count = try Thread.cpuCount();
-    if (core_count == 1) {
-        pool.* = .{
-            .workers = &[0]Worker{},
-        };
-        return pool;
+    pub fn init(callback: Callback) Runnable {
+        return Runnable{ .callback = callback };
     }
-    const worker_count = core_count - 1;
-    const workers = try gpa.alloc(Worker, worker_count);
-    errdefer gpa.free(workers);
+};
 
-    pool.* = .{
-        .workers = workers,
-    };
+pub const Options = struct {
+    allocator: ?*std.mem.Allocator = null,
+    max_threads: ?usize = null,
+};
 
-    // TODO handle if any of the spawns fail below
-    for (workers) |*worker| {
-        worker.* = .{
-            .func = undefined,
-            .context = undefined,
-            .pool = pool,
-            .reset_event = ResetEvent.init(),
-            .is_idle = true,
-            .thread = try Thread.spawn(worker, workerRun),
-        };
-    }
-
-    return pool;
+fn ReturnTypeOf(comptime entryFn: anytype) type {
+    return @typeInfo(@TypeOf(entryFn)).Fn.return_type.?;
 }
 
-pub fn destroy(pool: *ThreadPool, allocator: *Allocator) void {
-    {
-        var lock = pool.lock.acquire();
-        defer lock.release();
+pub fn run(options: Options, comptime entryFn: anytype, args: anytype) !ReturnTypeOf(entryFn) {
+    const Args = @TypeOf(args);
+    const Result = ReturnTypeOf(entryFn);
+    const Wrapper = struct {
+        fn_args: Args,
+        runnable: Runnable,
+        result: Result,
 
-        for (pool.workers) |*worker| {
-            worker.shutdown = true;
-            worker.reset_event.set();
-        }
-    }
-
-    for (pool.workers) |worker| {
-        worker.thread.wait();
-    }
-
-    allocator.free(pool.workers);
-    allocator.destroy(pool);
-}
-
-/// Must be called from the main thread.
-pub fn run(pool: *ThreadPool, context: anytype, comptime callback: fn (@TypeOf(context)) void) void {
-    if (pool.workers.len == 0) {
-        return callback(context);
-    }
-    const Context = @TypeOf(context);
-    const S = struct {
-        fn untyped_callback(data: usize) void {
-            callback(@intToPtr(Context, data));
+        fn callback(runnable: *Runnable) void {
+            const self = @fieldParentPtr(@This(), "runnable", runnable);
+            self.result = @call(.{}, entryFn, self.fn_args);
+            ThreadPool.get().?.shutdown();
         }
     };
-    const idle_worker: ?*Worker = blk: {
-        var lock = pool.lock.acquire();
-        defer lock.release();
 
-        for (pool.workers) |*worker| {
-            if (worker.is_idle) {
-                pool.active_tasks += 1;
-                break :blk worker;
-            }
-        } else {
-            break :blk null;
-        }
-    };
-    if (idle_worker) |w| {
-        w.is_idle = false;
-        w.context = @ptrToInt(context);
-        w.func = S.untyped_callback;
-        w.reset_event.set(); // wakeup, sleepy head
-    } else {
-        return callback(context);
-    }
+    var wrapper: Wrapper = undefined;
+    wrapper.fn_args = args;
+    wrapper.runnable = Runnable{ .callback = Wrapper.callback };
+
+    const allocator = options.allocator orelse std.heap.page_allocator;
+    const extra_threads =
+        if (std.builtin.single_threaded) @as(usize, 0) else if (options.max_threads) |t| std.math.max(1, t) - 1 else std.math.max(1, std.Thread.cpuCount() catch 1) - 1;
+
+    try runWithThreads(allocator, extra_threads, &wrapper.runnable);
+    return wrapper.result;
 }
 
-fn workerRun(worker: *Worker) void {
+fn runWithThreads(allocator: *std.mem.Allocator, extra_threads: usize, runnable: *Runnable) !void {
+    const threads = if (extra_threads == 0) &[_]*std.Thread{} else try allocator.alloc(*std.Thread, extra_threads);
+    defer allocator.free(threads);
+
+    var self = ThreadPool{
+        .threads = threads,
+        .allocator = allocator,
+    };
+    self.run_queue.push(runnable);
+
+    var spawned: usize = 0;
+    defer for (self.threads[0..spawned]) |thread|
+        thread.wait();
+
+    for (self.threads) |*thread| {
+        thread.* = std.Thread.spawn(&self, runWorker) catch break;
+        spawned += 1;
+    }
+
+    self.runWorker();
+}
+
+fn runWorker(self: *ThreadPool) void {
+    const old_pool = tls_current_pool;
+    tls_current_pool = self;
+    defer tls_current_pool = old_pool;
+
     while (true) {
-        worker.reset_event.wait();
-        if (worker.shutdown) return;
-        worker.func(worker.context);
-        worker.reset_event.reset();
-        {
-            var lock = worker.pool.lock.acquire();
-            defer lock.release();
-            worker.is_idle = true;
-            worker.pool.active_tasks -= 1;
+        const held = self.mutex.acquire();
+        if (self.is_shutdown) {
+            held.release();
+            break;
         }
+
+        if (self.run_queue.pop()) |runnable| {
+            held.release();
+            (runnable.callback)(runnable);
+            continue;
+        }
+
+        var idle_node = IdleQueue.Node{ .data = .{} };
+        self.idle_queue.prepend(&idle_node);
+        held.release();
+        idle_node.data.wait();
     }
 }
 
-pub fn finishActiveTasks(pool: *ThreadPool) void {
-    const any_active_tasks = blk: {
-        var lock = pool.lock.acquire();
-        defer lock.release();
+pub fn spawn(self: *ThreadPool, comptime runFn: anytype, args: anytype) !void {
+    const Args = @TypeOf(args);
+    const Wrapper = struct {
+        fn_args: Args,
+        allocator: *std.mem.Allocator,
+        runnable: Runnable,
 
-        for (pool.workers) |*worker| {
-            if (!worker.is_idle) {
-                break :blk true;
-            }
-        } else {
-            break :blk false;
+        fn run(runnable: *Runnable) void {
+            const this = @fieldParentPtr(@This(), "runnable", runnable);
+            const x = @call(.{}, runFn, this.fn_args);
+            this.allocator.destroy(this);
         }
     };
-}
 
-test "basic usage" {
-    var pool = try ThreadPool.create(std.testing.allocator);
-    var ctx: TestContext = .{
-        .input1_a = 11,
-        .input1_b = 22,
-        .result1 = undefined,
-
-        .input2_a = 10,
-        .input2_b = 11,
-        .result2 = undefined,
+    var wrapper = try self.allocator.create(Wrapper);
+    wrapper.* = Wrapper{
+        .fn_args = args,
+        .allocator = self.allocator,
+        .runnable = Runnable.init(Wrapper.run),
     };
-    {
-        defer pool.destroy(std.testing.allocator);
-        defer pool.finishActiveTasks();
-
-        pool.run(&ctx, work1);
-        pool.run(&ctx, work2);
-    }
-    std.testing.expectEqual(@as(i32, 33), ctx.result1);
-    std.testing.expectEqual(@as(i32, 110), ctx.result2);
+    self.schedule(&wrapper.runnable);
 }
 
-const TestContext = struct {
-    input1_a: i32,
-    input1_b: i32,
-    result1: i32,
+pub fn schedule(self: *ThreadPool, runnable: *Runnable) void {
+    const idle_node = blk: {
+        const held = self.mutex.acquire();
+        defer held.release();
 
-    input2_a: i32,
-    input2_b: i32,
-    result2: i32,
-};
+        if (self.is_shutdown)
+            return;
 
-fn work1(context: *TestContext) void {
-    std.debug.print("1 context: {}\n", .{context.*});
-    context.result1 = context.input1_a + context.input1_b;
+        self.run_queue.push(runnable);
+        break :blk self.idle_queue.popFirst();
+    };
+
+    if (idle_node) |node|
+        node.data.set();
 }
 
-fn work2(context: *TestContext) void {
-    std.debug.print("2 context: {}\n", .{context.*});
-    context.result2 = context.input2_a * context.input2_b;
+pub fn shutdown(self: *ThreadPool) void {
+    var idle_nodes = blk: {
+        const held = self.mutex.acquire();
+        defer held.release();
+
+        if (self.is_shutdown)
+            return;
+
+        const nodes = self.idle_queue;
+        self.idle_queue = IdleQueue{};
+        self.is_shutdown = true;
+        break :blk nodes;
+    };
+
+    while (idle_nodes.popFirst()) |node|
+        node.data.set();
 }

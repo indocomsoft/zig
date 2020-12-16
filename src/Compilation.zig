@@ -81,7 +81,6 @@ local_cache_directory: Directory,
 global_cache_directory: Directory,
 libc_include_dir_list: []const []const u8,
 rand: *std.rand.Random,
-thread_pool: *ThreadPool,
 
 /// Populated when we build the libc++ static library. A Job to build this is placed in the queue
 /// and resolved before calling linker.flush().
@@ -339,7 +338,6 @@ pub const InitOptions = struct {
     root_pkg: ?*Package,
     output_mode: std.builtin.OutputMode,
     rand: *std.rand.Random,
-    thread_pool: *ThreadPool,
     dynamic_linker: ?[]const u8 = null,
     /// `null` means to not emit a binary file.
     emit_bin: ?EmitLoc,
@@ -991,7 +989,6 @@ pub fn create(gpa: *Allocator, options: InitOptions) !*Compilation {
             .libc_include_dir_list = libc_dirs.libc_include_dir_list,
             .sanitize_c = sanitize_c,
             .rand = options.rand,
-            .thread_pool = comp.thread_pool,
             .clang_passthrough_mode = options.clang_passthrough_mode,
             .clang_preprocessor_mode = options.clang_preprocessor_mode,
             .verbose_cc = options.verbose_cc,
@@ -1255,7 +1252,7 @@ pub fn update(self: *Compilation) !void {
         }
     }
 
-    try self.performAllTheWork();
+    try (try ThreadPool.run(.{}, performAllTheWork, .{self}));
 
     if (!use_stage1) {
         if (self.bin_file.options.module) |module| {
@@ -1378,9 +1375,22 @@ pub fn getAllErrorsAlloc(self: *Compilation) !AllErrors {
     };
 }
 
-pub fn performAllTheWork(self: *Compilation) error{ TimerUnsupported, OutOfMemory }!void {
-    defer self.thread_pool.finishActiveTasks();
+const WaitGroup = struct {
+    count: usize,
+    event: std.AutoResetEvent = .{},
 
+    fn wait(self: *@This()) void {
+        while (@atomicLoad(usize, &self.count, .Monotonic) != 0)
+            self.event.wait();
+    }
+
+    fn done(self: *@This()) void {
+        if (@atomicRmw(usize, &self.count, .Sub, 1, .Monotonic) == 1)
+            self.event.set();
+    }
+};
+
+pub fn performAllTheWork(self: *Compilation) error{ TimerUnsupported, OutOfMemory }!void {
     var progress: std.Progress = .{};
     var main_progress_node = try progress.start("", null);
     defer main_progress_node.end();
@@ -1389,12 +1399,11 @@ pub fn performAllTheWork(self: *Compilation) error{ TimerUnsupported, OutOfMemor
     var c_comp_progress_node = main_progress_node.start("Compile C Objects", self.c_source_files.len);
     defer c_comp_progress_node.end();
 
+    var wg = WaitGroup{ .count = self.c_object_work_queue.count };
+    defer wg.wait();
+
     while (self.c_object_work_queue.readItem()) |c_object| {
-        self.thread_pool.run(.{
-            .compilation = self,
-            .c_object = c_object,
-            .progress_node = &c_comp_progress_node,
-        }, workerUpdateCObject);
+        try ThreadPool.get().?.spawn(workerUpdateCObject, .{ self, c_object, &c_comp_progress_node, &wg });
     }
 
     while (self.work_queue.readItem()) |work_item| switch (work_item) {
@@ -1718,26 +1727,30 @@ pub fn cImport(comp: *Compilation, c_src: []const u8) !CImportResult {
     };
 }
 
-fn workerUpdateCObject(context: struct {
-    compilation: *Compilation,
+fn workerUpdateCObject(
+    comp: *Compilation,
     c_object: *CObject,
     progress_node: *std.Progress.Node,
-}) void {
-    const comp = context.compilation;
-    const c_object = context.c_object;
+    wg: *WaitGroup,
+) void {
+    defer wg.done();
     comp.updateCObject(c_object, progress_node) catch |err| switch (err) {
         error.AnalysisFail => return,
         else => {
             {
                 var lock = comp.mutex.acquire();
                 defer lock.release();
-                try comp.failed_c_objects.ensureCapacity(comp.gpa, comp.failed_c_objects.items().len + 1);
-                comp.failed_c_objects.putAssumeCapacityNoClobber(c_object, try ErrorMsg.create(
+                comp.failed_c_objects.ensureCapacity(comp.gpa, comp.failed_c_objects.items().len + 1) catch {
+                    fatal("TODO handle this by setting c_object.status = oom failure", .{});
+                };
+                comp.failed_c_objects.putAssumeCapacityNoClobber(c_object, ErrorMsg.create(
                     comp.gpa,
                     0,
                     "unable to build C object: {s}",
                     .{@errorName(err)},
-                ));
+                ) catch {
+                    fatal("TODO handle this by setting c_object.status = oom failure", .{});
+                });
             }
             c_object.status = .{ .failure = {} };
         },
@@ -2831,7 +2844,6 @@ fn buildOutputFromZig(
         .root_pkg = &root_pkg,
         .output_mode = fixed_output_mode,
         .rand = comp.rand,
-        .thread_pool = comp.thread_pool,
         .libc_installation = comp.bin_file.options.libc_installation,
         .emit_bin = emit_bin,
         .optimize_mode = optimize_mode,
@@ -3205,7 +3217,6 @@ pub fn build_crt_file(
         .root_pkg = null,
         .output_mode = output_mode,
         .rand = comp.rand,
-        .thread_pool = comp.thread_pool,
         .libc_installation = comp.bin_file.options.libc_installation,
         .emit_bin = emit_bin,
         .optimize_mode = comp.bin_file.options.optimize_mode,
