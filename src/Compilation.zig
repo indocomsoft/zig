@@ -26,6 +26,7 @@ const Module = @import("Module.zig");
 const Cache = @import("Cache.zig");
 const stage1 = @import("stage1.zig");
 const translate_c = @import("translate_c.zig");
+const ThreadPool = @import("ThreadPool.zig");
 
 /// General-purpose allocator. Used for both temporary and long-term storage.
 gpa: *Allocator,
@@ -80,6 +81,7 @@ local_cache_directory: Directory,
 global_cache_directory: Directory,
 libc_include_dir_list: []const []const u8,
 rand: *std.rand.Random,
+thread_pool: *ThreadPool,
 
 /// Populated when we build the libc++ static library. A Job to build this is placed in the queue
 /// and resolved before calling linker.flush().
@@ -337,6 +339,7 @@ pub const InitOptions = struct {
     root_pkg: ?*Package,
     output_mode: std.builtin.OutputMode,
     rand: *std.rand.Random,
+    thread_pool: *ThreadPool,
     dynamic_linker: ?[]const u8 = null,
     /// `null` means to not emit a binary file.
     emit_bin: ?EmitLoc,
@@ -988,6 +991,7 @@ pub fn create(gpa: *Allocator, options: InitOptions) !*Compilation {
             .libc_include_dir_list = libc_dirs.libc_include_dir_list,
             .sanitize_c = sanitize_c,
             .rand = options.rand,
+            .thread_pool = comp.thread_pool,
             .clang_passthrough_mode = options.clang_passthrough_mode,
             .clang_preprocessor_mode = options.clang_preprocessor_mode,
             .verbose_cc = options.verbose_cc,
@@ -1375,6 +1379,8 @@ pub fn getAllErrorsAlloc(self: *Compilation) !AllErrors {
 }
 
 pub fn performAllTheWork(self: *Compilation) error{ TimerUnsupported, OutOfMemory }!void {
+    defer self.thread_pool.finishActiveTasks();
+
     var progress: std.Progress = .{};
     var main_progress_node = try progress.start("", null);
     defer main_progress_node.end();
@@ -1384,23 +1390,11 @@ pub fn performAllTheWork(self: *Compilation) error{ TimerUnsupported, OutOfMemor
     defer c_comp_progress_node.end();
 
     while (self.c_object_work_queue.readItem()) |c_object| {
-        self.updateCObject(c_object, &c_comp_progress_node) catch |err| switch (err) {
-            error.AnalysisFail => continue,
-            else => {
-                {
-                    var lock = self.mutex.acquire();
-                    defer lock.release();
-                    try self.failed_c_objects.ensureCapacity(self.gpa, self.failed_c_objects.items().len + 1);
-                    self.failed_c_objects.putAssumeCapacityNoClobber(c_object, try ErrorMsg.create(
-                        self.gpa,
-                        0,
-                        "unable to build C object: {s}",
-                        .{@errorName(err)},
-                    ));
-                }
-                c_object.status = .{ .failure = {} };
-            },
-        };
+        self.thread_pool.run(.{
+            .compilation = self,
+            .c_object = c_object,
+            .progress_node = &c_comp_progress_node,
+        }, workerUpdateCObject);
     }
 
     while (self.work_queue.readItem()) |work_item| switch (work_item) {
@@ -1724,6 +1718,32 @@ pub fn cImport(comp: *Compilation, c_src: []const u8) !CImportResult {
     };
 }
 
+fn workerUpdateCObject(context: struct {
+    compilation: *Compilation,
+    c_object: *CObject,
+    progress_node: *std.Progress.Node,
+}) void {
+    const comp = context.compilation;
+    const c_object = context.c_object;
+    comp.updateCObject(c_object, progress_node) catch |err| switch (err) {
+        error.AnalysisFail => return,
+        else => {
+            {
+                var lock = comp.mutex.acquire();
+                defer lock.release();
+                try comp.failed_c_objects.ensureCapacity(comp.gpa, comp.failed_c_objects.items().len + 1);
+                comp.failed_c_objects.putAssumeCapacityNoClobber(c_object, try ErrorMsg.create(
+                    comp.gpa,
+                    0,
+                    "unable to build C object: {s}",
+                    .{@errorName(err)},
+                ));
+            }
+            c_object.status = .{ .failure = {} };
+        },
+    };
+}
+
 fn updateCObject(comp: *Compilation, c_object: *CObject, c_comp_progress_node: *std.Progress.Node) !void {
     if (!build_options.have_llvm) {
         return comp.failCObj(c_object, "clang not available: compiler built without LLVM extensions", .{});
@@ -1928,10 +1948,13 @@ fn updateCObject(comp: *Compilation, c_object: *CObject, c_comp_progress_node: *
     };
 }
 
+var rand_mutex: std.Mutex = .{};
+
 pub fn tmpFilePath(comp: *Compilation, arena: *Allocator, suffix: []const u8) error{OutOfMemory}![]const u8 {
     const s = std.fs.path.sep_str;
     const rand_int = blk: {
-        var lock = comp.mutex.acquire();
+        // TODO https://github.com/ziglang/zig/issues/6704
+        var lock = rand_mutex.acquire();
         defer lock.release();
         break :blk comp.rand.int(u64);
     };
@@ -2808,6 +2831,7 @@ fn buildOutputFromZig(
         .root_pkg = &root_pkg,
         .output_mode = fixed_output_mode,
         .rand = comp.rand,
+        .thread_pool = comp.thread_pool,
         .libc_installation = comp.bin_file.options.libc_installation,
         .emit_bin = emit_bin,
         .optimize_mode = optimize_mode,
@@ -3181,6 +3205,7 @@ pub fn build_crt_file(
         .root_pkg = null,
         .output_mode = output_mode,
         .rand = comp.rand,
+        .thread_pool = comp.thread_pool,
         .libc_installation = comp.bin_file.options.libc_installation,
         .emit_bin = emit_bin,
         .optimize_mode = comp.bin_file.options.optimize_mode,
