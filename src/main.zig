@@ -1624,6 +1624,8 @@ fn buildOutputType(
     };
     var default_prng = std.rand.DefaultPrng.init(random_seed);
 
+    var thread_pool = ThreadPool.init(.{});
+
     var libc_installation: ?LibCInstallation = null;
     defer if (libc_installation) |*l| l.deinit(gpa);
 
@@ -1740,6 +1742,7 @@ fn buildOutputType(
         .function_sections = function_sections,
         .self_exe_path = self_exe_path,
         .rand = &default_prng.random,
+        .thread_pool = &thread_pool,
         .clang_passthrough_mode = arg_mode != .build,
         .clang_preprocessor_mode = clang_preprocessor_mode,
         .version = optional_version,
@@ -2410,6 +2413,7 @@ pub fn cmdBuild(gpa: *Allocator, arena: *Allocator, args: []const []const u8) !v
             break :blk random_seed;
         };
         var default_prng = std.rand.DefaultPrng.init(random_seed);
+        var thread_pool = ThreadPool.init(.{});
         const comp = Compilation.create(gpa, .{
             .zig_lib_directory = zig_lib_directory,
             .local_cache_directory = local_cache_directory,
@@ -2426,6 +2430,7 @@ pub fn cmdBuild(gpa: *Allocator, arena: *Allocator, args: []const []const u8) !v
             .optimize_mode = .Debug,
             .self_exe_path = self_exe_path,
             .rand = &default_prng.random,
+            .thread_pool = &thread_pool,
         }) catch |err| {
             fatal("unable to create compilation: {}", .{@errorName(err)});
         };

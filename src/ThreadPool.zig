@@ -1,187 +1,264 @@
 const std = @import("std");
 const ThreadPool = @This();
 
-allocator: *std.mem.Allocator,
-mutex: std.Mutex = std.Mutex{},
-threads: []*std.Thread,
-is_shutdown: bool = false,
-run_queue: RunQueue = RunQueue{},
-idle_queue: IdleQueue = IdleQueue{},
+lock: std.Mutex = .{},
+running: usize = 0,
+spawned: usize = 0,
+spawnable: usize,
+run_queue: Batch = .{},
+idle_queue: ?*Worker = null,
+spawned_queue: ?*Worker = null,
 
-threadlocal var tls_current_pool: ?*ThreadPool = null;
-
-pub fn get() ?*ThreadPool {
-    return tls_current_pool;
-}
-
-const IdleQueue = std.SinglyLinkedList(std.AutoResetEvent);
-const RunQueue = struct {
-    head: ?*Runnable = null,
-    tail: ?*Runnable = null,
-
-    fn push(self: *RunQueue, runnable: *Runnable) void {
-        if (self.tail) |tail|
-            tail.next = runnable;
-        if (self.head == null)
-            self.head = runnable;
-        self.tail = runnable;
-        runnable.next = null;
-    }
-
-    fn pop(self: *RunQueue) ?*Runnable {
-        const runnable = self.head orelse return null;
-        self.head = runnable.next;
-        if (self.head == null) self.tail = null;
-        return runnable;
-    }
-};
-
-pub const Callback = fn (*Runnable) void;
-pub const Runnable = struct {
-    next: ?*Runnable = undefined,
-    callback: Callback,
-
-    pub fn init(callback: Callback) Runnable {
-        return Runnable{ .callback = callback };
-    }
-};
-
-pub const Options = struct {
-    allocator: ?*std.mem.Allocator = null,
+pub const Config = struct {
     max_threads: ?usize = null,
 };
 
-fn ReturnTypeOf(comptime entryFn: anytype) type {
-    return @typeInfo(@TypeOf(entryFn)).Fn.return_type.?;
+pub fn init(config: Config) ThreadPool {
+    const max_threads = if (std.builtin.single_threaded)
+        @as(usize, 1)
+    else if (config.max_threads) |max_threads|
+        std.math.max(1, max_threads)
+    else
+        std.math.max(1, std.Thread.cpuCount() catch 1);
+    return .{ .spawnable = max_threads };
 }
 
-pub fn run(options: Options, comptime entryFn: anytype, args: anytype) !ReturnTypeOf(entryFn) {
+pub fn run(self: *ThreadPool) void {
+    self.spawned = 1;
+    Worker.run(null, self);
+}
+
+pub const SpawnConfig = struct {
+    allocator: *std.mem.Allocator,
+    hints: ScheduleHints = .{},
+};
+
+pub fn spawn(self: *ThreadPool, config: SpawnConfig, comptime func: anytype, args: anytype) !void {
     const Args = @TypeOf(args);
-    const Result = ReturnTypeOf(entryFn);
-    const Wrapper = struct {
+    const Closure = struct {
         fn_args: Args,
         runnable: Runnable,
-        result: Result,
+        allocator: *std.mem.Allocator,
 
         fn callback(runnable: *Runnable) void {
-            const self = @fieldParentPtr(@This(), "runnable", runnable);
-            self.result = @call(.{}, entryFn, self.fn_args);
-            ThreadPool.get().?.shutdown();
-        }
-    };
-
-    var wrapper: Wrapper = undefined;
-    wrapper.fn_args = args;
-    wrapper.runnable = Runnable{ .callback = Wrapper.callback };
-
-    const allocator = options.allocator orelse std.heap.page_allocator;
-    const extra_threads =
-        if (std.builtin.single_threaded) @as(usize, 0) else if (options.max_threads) |t| std.math.max(1, t) - 1 else std.math.max(1, std.Thread.cpuCount() catch 1) - 1;
-
-    try runWithThreads(allocator, extra_threads, &wrapper.runnable);
-    return wrapper.result;
-}
-
-fn runWithThreads(allocator: *std.mem.Allocator, extra_threads: usize, runnable: *Runnable) !void {
-    const threads = if (extra_threads == 0) &[_]*std.Thread{} else try allocator.alloc(*std.Thread, extra_threads);
-    defer allocator.free(threads);
-
-    var self = ThreadPool{
-        .threads = threads,
-        .allocator = allocator,
-    };
-    self.run_queue.push(runnable);
-
-    var spawned: usize = 0;
-    defer for (self.threads[0..spawned]) |thread|
-        thread.wait();
-
-    for (self.threads) |*thread| {
-        thread.* = std.Thread.spawn(&self, runWorker) catch break;
-        spawned += 1;
-    }
-
-    self.runWorker();
-}
-
-fn runWorker(self: *ThreadPool) void {
-    const old_pool = tls_current_pool;
-    tls_current_pool = self;
-    defer tls_current_pool = old_pool;
-
-    while (true) {
-        const held = self.mutex.acquire();
-        if (self.is_shutdown) {
-            held.release();
-            break;
-        }
-
-        if (self.run_queue.pop()) |runnable| {
-            held.release();
-            (runnable.callback)(runnable);
-            continue;
-        }
-
-        var idle_node = IdleQueue.Node{ .data = .{} };
-        self.idle_queue.prepend(&idle_node);
-        held.release();
-        idle_node.data.wait();
-    }
-}
-
-pub fn spawn(self: *ThreadPool, comptime runFn: anytype, args: anytype) !void {
-    const Args = @TypeOf(args);
-    const Wrapper = struct {
-        fn_args: Args,
-        allocator: *std.mem.Allocator,
-        runnable: Runnable,
-
-        fn run(runnable: *Runnable) void {
             const this = @fieldParentPtr(@This(), "runnable", runnable);
-            const x = @call(.{}, runFn, this.fn_args);
+            const result = @call(.{}, func, this.fn_args);
             this.allocator.destroy(this);
         }
     };
 
-    var wrapper = try self.allocator.create(Wrapper);
-    wrapper.* = Wrapper{
+    const allocator = config.allocator;
+    const closure = try allocator.create(Closure);
+    closure.* = .{
         .fn_args = args,
-        .allocator = self.allocator,
-        .runnable = Runnable.init(Wrapper.run),
+        .runnable = Runnable.init(Closure.callback),
+        .allocator = allocator,
     };
-    self.schedule(&wrapper.runnable);
+
+    const hints = config.hints;
+    self.schedule(hints, &closure.runnable);
 }
 
-pub fn schedule(self: *ThreadPool, runnable: *Runnable) void {
-    const idle_node = blk: {
-        const held = self.mutex.acquire();
-        defer held.release();
+pub const ScheduleHints = struct {
+    fifo: bool = false,
+};
 
-        if (self.is_shutdown)
+pub fn schedule(self: *ThreadPool, hints: ScheduleHints, batchable: anytype) void {
+    const batch = Batch.from(batchable);
+    if (batch.isEmpty())
+        return;
+
+    const held = self.lock.acquire();
+
+    if (hints.fifo) {
+        self.run_queue.pushBack(batch);
+    } else {
+        self.run_queue.pushFront(batch);
+    }
+
+    if (self.running > 0) {
+        if (self.idle_queue) |idle_queue| {
+            const worker = idle_queue;
+            self.idle_queue = worker.idle_next;
+            held.release();
+            return worker.event.set();
+        }
+
+        if (!std.builtin.single_threaded and self.spawned < self.spawnable) {
+            if (Worker.spawn(self))
+                self.spawned += 1;
+        }
+    }
+
+    held.release();
+}
+
+const Worker = struct {
+    thread: ?*std.Thread,
+    idle_next: ?*Worker = null,
+    spawned_next: ?*Worker = null,
+    event: std.AutoResetEvent = .{},
+
+    fn spawn(pool: *ThreadPool) bool {
+        const Spawner = struct {
+            tpool: *ThreadPool,
+            thread: *std.Thread = undefined,
+            data_event: std.AutoResetEvent = .{},
+            done_event: std.AutoResetEvent = .{},
+
+            fn run(self: *@This()) void {
+                self.data_event.wait();
+                const tpool = self.tpool;
+                const thread = self.thread;
+
+                self.done_event.set();
+                return Worker.run(thread, tpool);
+            }
+        };
+
+        var spawner: Spawner = .{ .tpool = pool };
+        spawner.thread = std.Thread.spawn(&spawner, Spawner.run) catch return false;
+        spawner.data_event.set();
+        spawner.done_event.wait();
+        return true;
+    }
+
+    fn run(thread: ?*std.Thread, pool: *ThreadPool) void {
+        var self: Worker = .{ .thread = thread };
+        var held = pool.lock.acquire();
+
+        self.spawned_next = pool.spawned_queue;
+        pool.spawned_queue = &self;
+
+        while (true) {
+            if (pool.run_queue.popFront()) |runnable| {
+                pool.running += 1;
+                held.release();
+
+                runnable.run();
+                held = pool.lock.acquire();
+                pool.running -= 1;
+                continue;
+            }
+
+            if (pool.running > 0) {
+                self.idle_next = pool.idle_queue;
+                pool.idle_queue = &self;
+                held.release();
+
+                self.event.wait();
+                held = pool.lock.acquire();
+                continue;
+            }
+
+            pool.spawned -= 1;
+            const is_last = pool.spawned == 0;
+            const is_root_worker = thread == null;
+
+            var idle_queue = pool.idle_queue;
+            pool.idle_queue = null;
+            held.release();
+
+            while (true) {
+                const idle_worker = idle_queue orelse break;
+                idle_queue = idle_worker.idle_next;
+                idle_worker.event.set();
+            }
+
+            if (is_last and !is_root_worker) {
+                var root_worker = pool.spawned_queue orelse unreachable;
+                while (root_worker.spawned_next) |next|
+                    root_worker = next;
+                root_worker.event.set();
+            }
+
+            if (!is_root_worker or !is_last)
+                self.event.wait();
+
+            if (is_root_worker) {
+                while (true) {
+                    const worker = pool.spawned_queue orelse break;
+                    pool.spawned_queue = worker.spawned_next;
+                    const idle_thread = worker.thread orelse continue;
+                    worker.event.set();
+                    idle_thread.wait();
+                }
+            }
+
+            return;
+        }
+    }
+};
+
+pub const Batch = struct {
+    head: ?*Runnable = null,
+    tail: *Runnable = undefined,
+
+    pub fn from(batchable: anytype) Batch {
+        return switch (@TypeOf(batchable)) {
+            Batch => return batchable,
+            ?*Runnable => return from(batchable orelse return .{}),
+            *Runnable => {
+                batchable.next = null;
+                return .{
+                    .head = batchable,
+                    .tail = batchable,
+                };
+            },
+            else => unreachable,
+        };
+    }
+
+    pub fn isEmpty(self: Batch) bool {
+        return self.head == null;
+    }
+
+    pub fn pushFront(self: *Batch, batchable: anytype) void {
+        const batch = from(batchable);
+        if (batch.isEmpty())
             return;
 
-        self.run_queue.push(runnable);
-        break :blk self.idle_queue.popFirst();
-    };
+        if (self.isEmpty()) {
+            self.* = batch;
+        } else {
+            batch.tail.next = self.head;
+            self.head = batch.head;
+        }
+    }
 
-    if (idle_node) |node|
-        node.data.set();
-}
-
-pub fn shutdown(self: *ThreadPool) void {
-    var idle_nodes = blk: {
-        const held = self.mutex.acquire();
-        defer held.release();
-
-        if (self.is_shutdown)
+    pub fn pushBack(self: *Batch, batchable: anytype) void {
+        const batch = from(batchable);
+        if (batch.isEmpty())
             return;
 
-        const nodes = self.idle_queue;
-        self.idle_queue = IdleQueue{};
-        self.is_shutdown = true;
-        break :blk nodes;
-    };
+        if (self.isEmpty()) {
+            self.* = batch;
+        } else {
+            self.tail.next = batch.head;
+            self.tail = batch.tail;
+        }
+    }
 
-    while (idle_nodes.popFirst()) |node|
-        node.data.set();
-}
+    pub fn popFront(self: *Batch) ?*Runnable {
+        const runnable = self.head orelse return null;
+        self.head = runnable.next;
+        return runnable;
+    }
+};
+
+pub const Runnable = struct {
+    next: ?*Runnable = null,
+    callback: Callback,
+
+    pub fn init(callback: Callback) Runnable {
+        return .{ .callback = callback };
+    }
+
+    pub fn run(self: *Runnable) void {
+        return (self.callback)(self);
+    }
+};
+
+pub const Callback = fn (
+    *Runnable,
+) void;
