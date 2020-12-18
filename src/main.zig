@@ -1624,7 +1624,9 @@ fn buildOutputType(
     };
     var default_prng = std.rand.DefaultPrng.init(random_seed);
 
-    var thread_pool = ThreadPool.init(.{});
+    var thread_pool: ThreadPool = undefined;
+    try thread_pool.init(gpa);
+    defer thread_pool.deinit();
 
     var libc_installation: ?LibCInstallation = null;
     defer if (libc_installation) |*l| l.deinit(gpa);
@@ -2413,7 +2415,9 @@ pub fn cmdBuild(gpa: *Allocator, arena: *Allocator, args: []const []const u8) !v
             break :blk random_seed;
         };
         var default_prng = std.rand.DefaultPrng.init(random_seed);
-        var thread_pool = ThreadPool.init(.{});
+        var thread_pool: ThreadPool = undefined;
+        try thread_pool.init(gpa);
+        defer thread_pool.deinit();
         const comp = Compilation.create(gpa, .{
             .zig_lib_directory = zig_lib_directory,
             .local_cache_directory = local_cache_directory,

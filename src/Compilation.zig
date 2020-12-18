@@ -27,6 +27,7 @@ const Cache = @import("Cache.zig");
 const stage1 = @import("stage1.zig");
 const translate_c = @import("translate_c.zig");
 const ThreadPool = @import("ThreadPool.zig");
+const WaitGroup = @import("WaitGroup.zig");
 
 /// General-purpose allocator. Used for both temporary and long-term storage.
 gpa: *Allocator,
@@ -1387,11 +1388,13 @@ pub fn performAllTheWork(self: *Compilation) error{ TimerUnsupported, OutOfMemor
     var c_comp_progress_node = main_progress_node.start("Compile C Objects", self.c_source_files.len);
     defer c_comp_progress_node.end();
 
-    defer self.thread_pool.run();
+    var wg = WaitGroup{};
+    defer wg.wait();
 
     while (self.c_object_work_queue.readItem()) |c_object| {
-        try self.thread_pool.spawn(.{ .allocator = self.gpa }, workerUpdateCObject, .{
-            self, c_object, &c_comp_progress_node,
+        wg.start();
+        try self.thread_pool.spawn(workerUpdateCObject, .{
+            self, c_object, &c_comp_progress_node, &wg,
         });
     }
 
@@ -1720,7 +1723,10 @@ fn workerUpdateCObject(
     comp: *Compilation,
     c_object: *CObject,
     progress_node: *std.Progress.Node,
+    wg: *WaitGroup,
 ) void {
+    defer wg.stop();
+
     comp.updateCObject(c_object, progress_node) catch |err| switch (err) {
         error.AnalysisFail => return,
         else => {
